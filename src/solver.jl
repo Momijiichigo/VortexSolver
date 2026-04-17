@@ -14,9 +14,12 @@ The BdG eigenvalue problem (ℏ=1):
 Self-consistency (from mean-field decoupling):
   Δ(x,y) = V Σ_n v_n*(x,y) u_n(x,y) (1 - 2fₙ)
   U(x,y) = -V Σ_n (|u_n|² fₙ + |v_n|² (1−fₙ))    [if use_hartree]
+
+GPU architecture: Delta and U live on the device for the entire SCF loop;
+only the static He_base, boundary mask, and final results are ever on the CPU.
 """
 
-using LinearAlgebra, SparseArrays
+using LinearAlgebra, SparseArrays, CUDA
 
 fermi(ε, T) = T == 0.0 ? (ε < 0 ? 1.0 : 0.0) : 1.0 / (exp(ε / T) + 1.0)
 
@@ -29,25 +32,15 @@ function laplacian_2d(Ngrid::Int, h::Float64)
     N2 = Ngrid^2
     Is = Int[]; Js = Int[]; Vs = Float64[]
 
-    function idx(i, j)
-        return (i-1)*Ngrid + j
-    end
-    function add!(i, j, val)
-        push!(Is, i); push!(Js, j); push!(Vs, val)
-    end
+    idx(i, j) = (i-1)*Ngrid + j
 
     for i in 1:Ngrid, j in 1:Ngrid
         k = idx(i, j)
-        boundary = (i == 1 || i == Ngrid || j == 1 || j == Ngrid)
-        if boundary
-            add!(k, k, 1.0)
-        else
-            add!(k, k,            -4.0 / h^2)
-            add!(k, idx(i-1, j),   1.0 / h^2)
-            add!(k, idx(i+1, j),   1.0 / h^2)
-            add!(k, idx(i, j-1),   1.0 / h^2)
-            add!(k, idx(i, j+1),   1.0 / h^2)
-        end
+        push!(Is, k); push!(Js, k); push!(Vs, -4.0 / h^2)
+        if i > 1;     push!(Is, k); push!(Js, idx(i-1, j)); push!(Vs, 1.0 / h^2); end
+        if i < Ngrid; push!(Is, k); push!(Js, idx(i+1, j)); push!(Vs, 1.0 / h^2); end
+        if j > 1;     push!(Is, k); push!(Js, idx(i, j-1)); push!(Vs, 1.0 / h^2); end
+        if j < Ngrid; push!(Is, k); push!(Js, idx(i, j+1)); push!(Vs, 1.0 / h^2); end
     end
     return sparse(Is, Js, Vs, N2, N2)
 end
@@ -69,71 +62,118 @@ function gl_profile_2d(xs::Vector{Float64}, ys::Vector{Float64},
 end
 
 """
-Assemble and diagonalize the 2D BdG Hamiltonian for the given complex Δ(x,y)
-and real U(x,y) (both as flat vectors of length Ngrid²).
-Returns eigenvalues ε and (u, v) eigenvectors (each column is one eigenstate).
+Assemble and diagonalize the 2D BdG Hamiltonian entirely on the GPU.
+He_base_gpu is the static -∇²/(2m) - μ part (uploaded once before the SCF loop).
+Delta_gpu and U_gpu are device arrays updated each iteration.
+Returns vals_gpu, us_gpu, vs_gpu as CuArrays — no CPU transfer here.
 """
-function solve_bdg(p::SolverParams, lap::SparseMatrixCSC,
-                   Delta::Vector{ComplexF64}, U::Vector{Float64})
+function solve_bdg(p::SolverParams, He_base_gpu::CuMatrix{ComplexF64},
+                   Delta_gpu::CuVector{ComplexF64}, U_gpu::CuVector{Float64})
     N2 = p.Ngrid^2
 
-    He = Matrix(-lap ./ (2p.m) - p.mu * I + Diagonal(U))
+    # Add the density-dependent Hartree shift on the GPU
+    He_gpu = He_base_gpu .+ Diagonal(U_gpu)
 
-    D  = Diagonal(Delta)
-    Dc = Diagonal(conj.(Delta))
+    # Assemble 2N²×2N² BdG Hamiltonian on the GPU using block-view assignment.
+    # @views avoids temporary copies; Diagonal(CuVector) broadcasts correctly into
+    # CuArray views without scalar indexing.
+    H_gpu = CUDA.zeros(ComplexF64, 2N2, 2N2)
+    @views H_gpu[1:N2,     1:N2]      .= He_gpu
+    @views H_gpu[N2+1:2N2, N2+1:2N2] .= -He_gpu
+    @views H_gpu[1:N2,     N2+1:2N2] .= Diagonal(Delta_gpu)
+    @views H_gpu[N2+1:2N2, 1:N2]     .= Diagonal(conj.(Delta_gpu))
 
-    H = ComplexF64[He  D;
-                   Dc  -He]
+    vals_gpu, vecs_gpu = eigen(Hermitian(H_gpu))
 
-    vals, vecs = eigen(Hermitian(H))
-    us = vecs[1:N2, :]
-    vs = vecs[N2+1:end, :]
-    return vals, us, vs
+    us_gpu = vecs_gpu[1:N2, :]
+    vs_gpu = vecs_gpu[N2+1:2N2, :]
+    return vals_gpu, us_gpu, vs_gpu
 end
 
 """
-Update Δ(x,y) and U(x,y) from the BdG eigensolutions.
+Vectorized gap and Hartree update on the GPU — no scalar indexing or per-state loops.
+
+Gap update (vectorized over all 2N² states at once):
+  Δ_new = (V/h²) · (conj(V_mat) .* U_mat) · w_gap
+  where w_gap[n] = (1 − 2fₙ) · [εₙ > 0]
+
+Hartree update:
+  U_new = −(V/h²) · (|U_mat|² · f + |V_mat|² · (1−f))
 """
-function update_fields(p::SolverParams,
-                       vals::Vector{Float64},
-                       us::Matrix{ComplexF64},
-                       vs::Matrix{ComplexF64})
-    N2 = p.Ngrid^2
-    Delta_new = zeros(ComplexF64, N2)
-    U_new     = zeros(Float64, N2)
-    for n in eachindex(vals)
-        fn = fermi(vals[n], p.temperature)
-        Delta_new .+= p.V .* conj.(vs[:, n]) .* us[:, n] .* (1 - 2fn)
-        if p.use_hartree
-            U_new .-= p.V .* (abs2.(us[:, n]) .* fn .+ abs2.(vs[:, n]) .* (1 - fn))
-        end
+function update_fields(p::SolverParams, h::Float64,
+                       vals_gpu::CuVector{Float64},
+                       us_gpu::CuMatrix{ComplexF64},
+                       vs_gpu::CuMatrix{ComplexF64})
+    fn = fermi.(vals_gpu, p.temperature)
+
+    # Only positive-energy states enter the gap equation
+    pos_mask    = vals_gpu .> 0
+    weights_gap = (1 .- 2 .* fn) .* pos_mask      # (2N²,) real
+
+    # Delta_new[k] = (V/h²) Σ_n conj(v[k,n]) u[k,n] w_gap[n]
+    #              = (V/h²) · row-wise dot of (conj(V) .* U) with w_gap
+    Delta_new = (p.V / h^2) .* ((conj.(vs_gpu) .* us_gpu) * weights_gap)
+
+    if p.use_hartree
+        U_new = -(p.V / h^2) .* (abs2.(us_gpu) * fn .+ abs2.(vs_gpu) * (1 .- fn))
+    else
+        U_new = CUDA.zeros(Float64, p.Ngrid^2)
     end
+
     return Delta_new, U_new
 end
 
 """
-Run the SCF loop on a 2D Cartesian grid.
+Run the SCF loop on a 2D Cartesian grid, keeping Delta and U on the GPU
+throughout. Only final results are transferred to the CPU.
 Returns (xs, ys, Delta_converged, U_converged, converged::Bool)
-where Delta is a complex Ngrid×Ngrid matrix.
+where Delta and U are Ngrid×Ngrid CPU matrices.
 """
 function run_scf(p::SolverParams)
     @info "starting scf"
     h  = 2p.L / (p.Ngrid - 1)
     xs = range(-p.L, p.L; length=p.Ngrid) |> collect
     ys = xs
+    N2 = p.Ngrid^2
 
-    lap   = laplacian_2d(p.Ngrid, h)
-    Delta = gl_profile_2d(xs, ys, p.gap_inf, p.coherence_length, p.n_vortex)
-    U     = zeros(p.Ngrid^2)
+    # --- One-time CPU work: build static He_base, upload to GPU ---
+    lap     = laplacian_2d(p.Ngrid, h)
+    He_base = ComplexF64.(Matrix(-lap ./ (2p.m)))
+    He_base[diagind(He_base)] .-= p.mu
+    He_base_gpu = CuArray(He_base)
+
+    # --- Initial fields: GL profile on CPU, then push to GPU ---
+    Delta_gpu = CuArray(gl_profile_2d(xs, ys, p.gap_inf, p.coherence_length, p.n_vortex))
+    U_gpu     = CUDA.zeros(Float64, N2)
+
+    # --- Precompute boundary mask and pinned GL values (uploaded once) ---
+    boundary_mask = zeros(Bool, N2)
+    Delta_bc      = zeros(ComplexF64, N2)
+    for i in 1:p.Ngrid, j in 1:p.Ngrid
+        if i == 1 || i == p.Ngrid || j == 1 || j == p.Ngrid
+            k           = (i-1)*p.Ngrid + j
+            theta       = atan(ys[j], xs[i])
+            boundary_mask[k] = true
+            Delta_bc[k]      = p.gap_inf * exp(-im * p.n_vortex * theta)
+        end
+    end
+    boundary_mask_gpu = CuArray(boundary_mask)
+    Delta_bc_gpu      = CuArray(Delta_bc)
 
     converged = false
     for iter in 1:p.max_iter
-        vals, us, vs = solve_bdg(p, lap, Delta, U)
-        Delta_new, U_new = update_fields(p, vals, us, vs)
+        vals_gpu, us_gpu, vs_gpu       = solve_bdg(p, He_base_gpu, Delta_gpu, U_gpu)
+        Delta_new_gpu, U_new_gpu       = update_fields(p, h, vals_gpu, us_gpu, vs_gpu)
 
-        err = maximum(abs.(Delta_new .- Delta))
-        Delta = p.mixing .* Delta_new .+ (1 - p.mixing) .* Delta
-        U     = p.mixing .* U_new     .+ (1 - p.mixing) .* U
+        # Pin boundary to the bulk GL profile — fully vectorized, no scalar indexing
+        @. Delta_new_gpu = ifelse(boundary_mask_gpu, Delta_bc_gpu, Delta_new_gpu)
+
+        # Convergence check: GPU reduction → CPU scalar
+        err = maximum(abs.(Delta_new_gpu .- Delta_gpu)) / p.gap_inf
+
+        # Linear mixing on GPU
+        @. Delta_gpu = p.mixing * Delta_new_gpu + (1 - p.mixing) * Delta_gpu
+        @. U_gpu     = p.mixing * U_new_gpu     + (1 - p.mixing) * U_gpu
 
         if err < p.tol
             converged = true
@@ -144,7 +184,8 @@ function run_scf(p::SolverParams)
     end
     converged || @warn "SCF did not converge within $(p.max_iter) iterations"
 
-    Delta_2d = reshape(Delta, p.Ngrid, p.Ngrid)
-    U_2d     = reshape(U,     p.Ngrid, p.Ngrid)
+    # Transfer final results to CPU only here
+    Delta_2d = reshape(Array(Delta_gpu), p.Ngrid, p.Ngrid)
+    U_2d     = reshape(Array(U_gpu),     p.Ngrid, p.Ngrid)
     return xs, ys, Delta_2d, U_2d, converged
 end
