@@ -160,10 +160,11 @@ function run_scf(p::SolverParams)
     boundary_mask_gpu = CuArray(boundary_mask)
     Delta_bc_gpu      = CuArray(Delta_bc)
 
+    vals_gpu = us_gpu = vs_gpu = nothing
     converged = false
     for iter in 1:p.max_iter
-        vals_gpu, us_gpu, vs_gpu       = solve_bdg(p, He_base_gpu, Delta_gpu, U_gpu)
-        Delta_new_gpu, U_new_gpu       = update_fields(p, h, vals_gpu, us_gpu, vs_gpu)
+        vals_gpu, us_gpu, vs_gpu = solve_bdg(p, He_base_gpu, Delta_gpu, U_gpu)
+        Delta_new_gpu, U_new_gpu = update_fields(p, h, vals_gpu, us_gpu, vs_gpu)
 
         # Pin boundary to the bulk GL profile — fully vectorized, no scalar indexing
         @. Delta_new_gpu = ifelse(boundary_mask_gpu, Delta_bc_gpu, Delta_new_gpu)
@@ -184,8 +185,12 @@ function run_scf(p::SolverParams)
     end
     converged || @warn "SCF did not converge within $(p.max_iter) iterations"
 
-    # Transfer final results to CPU only here
+    # Transfer all final results to CPU only here
     Delta_2d = reshape(Array(Delta_gpu), p.Ngrid, p.Ngrid)
     U_2d     = reshape(Array(U_gpu),     p.Ngrid, p.Ngrid)
-    return xs, ys, Delta_2d, U_2d, converged
+    vals     = Array(vals_gpu)
+    us       = Array(us_gpu)
+    vs       = Array(vs_gpu)
+
+    return xs, ys, Delta_2d, U_2d, converged, vals, us, vs
 end
