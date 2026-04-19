@@ -147,18 +147,18 @@ function run_scf(p::SolverParams)
     U_gpu     = CUDA.zeros(Float64, N2)
 
     # --- Precompute boundary mask and pinned GL values (uploaded once) ---
-    boundary_mask = zeros(Bool, N2)
-    Delta_bc      = zeros(ComplexF64, N2)
-    for i in 1:p.Ngrid, j in 1:p.Ngrid
-        if i == 1 || i == p.Ngrid || j == 1 || j == p.Ngrid
-            k           = (i-1)*p.Ngrid + j
-            theta       = atan(ys[j], xs[i])
-            boundary_mask[k] = true
-            Delta_bc[k]      = p.gap_inf * exp(-im * p.n_vortex * theta)
-        end
-    end
-    boundary_mask_gpu = CuArray(boundary_mask)
-    Delta_bc_gpu      = CuArray(Delta_bc)
+    # boundary_mask = zeros(Bool, N2)
+    # Delta_bc      = zeros(ComplexF64, N2)
+    # for i in 1:p.Ngrid, j in 1:p.Ngrid
+    #     if i == 1 || i == p.Ngrid || j == 1 || j == p.Ngrid
+    #         k           = (i-1)*p.Ngrid + j
+    #         theta       = atan(ys[j], xs[i])
+    #         boundary_mask[k] = true
+    #         Delta_bc[k]      = p.gap_inf * exp(-im * p.n_vortex * theta)
+    #     end
+    # end
+    # boundary_mask_gpu = CuArray(boundary_mask)
+    # Delta_bc_gpu      = CuArray(Delta_bc)
 
     vals_gpu = us_gpu = vs_gpu = nothing
     converged = false
@@ -167,7 +167,7 @@ function run_scf(p::SolverParams)
         Delta_new_gpu, U_new_gpu = update_fields(p, h, vals_gpu, us_gpu, vs_gpu)
 
         # Pin boundary to the bulk GL profile — fully vectorized, no scalar indexing
-        @. Delta_new_gpu = ifelse(boundary_mask_gpu, Delta_bc_gpu, Delta_new_gpu)
+        # @. Delta_new_gpu = ifelse(boundary_mask_gpu, Delta_bc_gpu, Delta_new_gpu)
 
         # Convergence check: GPU reduction → CPU scalar
         err = maximum(abs.(Delta_new_gpu .- Delta_gpu)) / p.gap_inf
