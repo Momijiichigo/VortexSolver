@@ -25,7 +25,7 @@ fermi(ε, T) = T == 0.0 ? (ε < 0 ? 1.0 : 0.0) : 1.0 / (exp(ε / T) + 1.0)
 
 """
 Build the 2D finite-difference Laplacian on an Ngrid×Ngrid grid with
-spacing h, using Dirichlet (zero) boundary conditions.
+spacing h, using Neumann (zero derivative / free) boundary conditions.
 Returns a sparse (Ngrid²)×(Ngrid²) matrix.
 """
 function laplacian_2d(Ngrid::Int, h::Float64)
@@ -36,11 +36,30 @@ function laplacian_2d(Ngrid::Int, h::Float64)
 
     for i in 1:Ngrid, j in 1:Ngrid
         k = idx(i, j)
-        push!(Is, k); push!(Js, k); push!(Vs, -4.0 / h^2)
-        if i > 1;     push!(Is, k); push!(Js, idx(i-1, j)); push!(Vs, 1.0 / h^2); end
-        if i < Ngrid; push!(Is, k); push!(Js, idx(i+1, j)); push!(Vs, 1.0 / h^2); end
-        if j > 1;     push!(Is, k); push!(Js, idx(i, j-1)); push!(Vs, 1.0 / h^2); end
-        if j < Ngrid; push!(Is, k); push!(Js, idx(i, j+1)); push!(Vs, 1.0 / h^2); end
+        
+        # Start with 0 on the diagonal, and count existing neighbors
+        diag_val = 0.0
+        
+        if i > 1
+            push!(Is, k); push!(Js, idx(i-1, j)); push!(Vs, 1.0 / h^2)
+            diag_val -= 1.0 / h^2
+        end
+        if i < Ngrid
+            push!(Is, k); push!(Js, idx(i+1, j)); push!(Vs, 1.0 / h^2)
+            diag_val -= 1.0 / h^2
+        end
+        if j > 1
+            push!(Is, k); push!(Js, idx(i, j-1)); push!(Vs, 1.0 / h^2)
+            diag_val -= 1.0 / h^2
+        end
+        if j < Ngrid
+            push!(Is, k); push!(Js, idx(i, j+1)); push!(Vs, 1.0 / h^2)
+            diag_val -= 1.0 / h^2
+        end
+        
+        # The diagonal perfectly balances the existing off-diagonals
+        # Interior: -4/h^2. Edges: -3/h^2. Corners: -2/h^2.
+        push!(Is, k); push!(Js, k); push!(Vs, diag_val)
     end
     return sparse(Is, Js, Vs, N2, N2)
 end
@@ -115,7 +134,15 @@ function update_fields(p::SolverParams, h::Float64,
     Delta_new = (p.V / h^2) .* ((conj.(vs_gpu) .* us_gpu) * weights_gap)
 
     if p.use_hartree
-        U_new = -(p.V / h^2) .* (abs2.(us_gpu) * fn .+ abs2.(vs_gpu) * (1 .- fn))
+        # 1. Calculate the raw physical density (electrons per unit area)
+        density_gpu = (abs2.(us_gpu) * fn .+ abs2.(vs_gpu) * (1 .- fn)) ./ h^2
+        
+        # 2. Extract the bulk background density from a boundary point (e.g., index 1)
+        # We need a tiny CPU transfer here just to read the corner value
+        n_0 = Array(density_gpu)[1] 
+        
+        # 3. Apply the Hartree shift using ONLY the density fluctuations
+        U_new = -p.V .* (density_gpu .- n_0)
     else
         U_new = CUDA.zeros(Float64, p.Ngrid^2)
     end
