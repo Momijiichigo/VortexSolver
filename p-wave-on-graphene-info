@@ -1,0 +1,33 @@
+Complete BdG Hamiltonian
+
+H_BdG = [h(r), Δ(r);
+Δ*(r), -h*(r)]
+
+with eigenvector: (u^A (r), u^B (r), v^A (r), v^B (r))
+
+where
+h(r) = [-μ, t*(3 - a_1⋅∇ - a_2⋅∇);
+t*(3 + a_1⋅∇ + a_2⋅∇), -μ]
+
+h*(r) = [-μ, t*(3 - a_1⋅∇ - a_2⋅∇);
+t*(3 + a_1⋅∇ + a_2⋅∇), -μ]
+
+(t is the hopping amplitude)
+
+and Δ(r) = [0, 0;
+(Δ_0 + Δ_1 (1 + a_1⋅∇) + Δ_2 (1 + a_2⋅∇)), 0]
+
+Δ*(r) = [0, (Δ_0 + Δ_1 (1 - a_1⋅∇) + Δ_2 (1 - a_2⋅∇));
+0, 0]
+
+(the complex conjugate one has derivative sign flipped:)
+
+
+The three gap fields, each responsible for three nearest-neighbor pairing.
+
+Δ_0(r) = V Σ_n [ v_n^A (r)^* u_n^B (r) f(E_n) + u_n^A (r) v_n^B (r)^* (1 - f(E_n)) ]
+
+Δ_1(r) = Δ_0(r) - Σ_n a_1 ⋅ [ v_n^A (r)^* ∇ u_n^B (r) f(E_n) + u_n^A (r) ∇ v_n^B (r)^* (1 - f(E_n)) ]
+
+Δ_2(r) = Δ_0(r) - Σ_n a_2 ⋅ [ v_n^A (r)^* ∇ u_n^B (r) f(E_n) + u_n^A (r) ∇ v_n^B (r)^* (1 - f(E_n)) ]
+
